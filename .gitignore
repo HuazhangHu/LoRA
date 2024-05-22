@@ -1,1 +1,4 @@
 runwayml/*
+dataset/*
+ckpt/*
+lllyasviel/*
