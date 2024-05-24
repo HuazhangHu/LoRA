@@ -1,4 +1,4 @@
-from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel
+from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, StableDiffusionControlNetPipeline
 from PIL import Image
 import cv2
 import numpy as np
@@ -7,7 +7,7 @@ lora_path = 'ckpt/checkpoint-4000'
 sd_path = 'runwayml/stable-diffusion-v1-5'
 controlnet_canny_path = 'lllyasviel/sd-controlnet-canny'
 
-prompt = 'A man wearing ancient clothes, standing by the river with a damaged city behind him, holding a sword in his hand, \
+prompt = 'A women wearing ancient clothes, standing by the river with a damaged city behind him, \
         with a sad expression, is a Chinese national style comic'
 neg_prompt = 'longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, {multiple people}'
 

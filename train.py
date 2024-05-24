@@ -21,6 +21,7 @@ import os
 import random
 import shutil
 from pathlib import Path
+from PIL import Image
 
 import datasets
 import numpy as np
@@ -48,20 +49,20 @@ from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, 
 from diffusers.utils.import_utils import is_xformers_available
 from training_cfg import load_training_config
 
+from dataloader_train import TrainData
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-
-def main():
+def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('cfg', type=str)
     args = parser.parse_args()
 
-    cfg_path = args.cfg
+    return args
 
-    cfg = load_training_config(cfg_path)
+def get_accelerator(cfg):
     logging_dir = Path(cfg.log_dir)
 
     accelerator_project_config = ProjectConfiguration(
@@ -74,13 +75,6 @@ def main():
         project_config=accelerator_project_config, # 输出config log
     )
 
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -98,10 +92,14 @@ def main():
     if accelerator.is_main_process:
         if cfg.output_dir is not None:
             os.makedirs(cfg.output_dir, exist_ok=True)
+
+    return accelerator
+
+def get_models(cfg):
     # Load scheduler, tokenizer and models.
+    ### loading scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
         cfg.pretrained_model_name_or_path, subfolder="scheduler")
-    
     ### model loading
     tokenizer = CLIPTokenizer.from_pretrained(
         cfg.pretrained_model_name_or_path, subfolder="tokenizer"
@@ -116,37 +114,64 @@ def main():
         cfg.pretrained_model_name_or_path, subfolder="unet"
     )
 
-    # freeze parameters of models to save more memory
-    unet.requires_grad_(False)  # Freeze
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    return noise_scheduler, tokenizer, text_encoder, vae, unet
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Freeze the unet parameters before adding adapters
-    for param in unet.parameters():
-        param.requires_grad_(False)
-
-    unet_lora_config = LoraConfig(
+def lora_adapter(cfg):
+    lora_config = LoraConfig(
         r=cfg.rank,
         lora_alpha=cfg.rank,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
 
+    return lora_config
+
+
+def main():
+    args = get_args()
+    cfg_path = args.cfg
+
+    cfg = load_training_config(cfg_path) #  TrainingConfig Class
+
+    accelerator = get_accelerator(cfg)
+    
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+
+    # Load scheduler, tokenizer and models.
+    noise_scheduler, tokenizer, text_encoder, vae, unet = get_models(cfg)
+    # freeze parameters of models to save more memory
+    unet.requires_grad_(False)  # Freeze
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+
+    # Freeze the unet parameters before adding adapters for training
+    for param in unet.parameters():
+        param.requires_grad_(False)
+
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32 #  full precision
+    if accelerator.mixed_precision == "fp16": # half-precision
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
+     #lora_adapter
+    lora_config = lora_adapter(cfg)
     # Add adapter and make sure the trainable params are in float32.
-    unet.add_adapter(unet_lora_config)
+    unet.add_adapter(lora_config)
+    
     if cfg.mixed_precision == "fp16":
         for param in unet.parameters():
             # only upcast trainable parameters (LoRA) into fp32
@@ -156,21 +181,17 @@ def main():
     if cfg.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
-
             xformers_version = version.parse(xformers.__version__)
             # print("xformers_version:",xformers_version)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
             unet.enable_xformers_memory_efficient_attention() #函数会尝试启用 xformers 来提升 Attention 的效率
         else:
             raise ValueError(
                 "xformers is not available. Make sure it is installed correctly")
 
     lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
-    optimizer_cls = torch.optim.AdamW
 
+    # only optimize lora layers
+    optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
         lora_layers,
         lr=cfg.learning_rate,
@@ -183,75 +204,15 @@ def main():
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    dataset = load_dataset(
-        "imagefolder",
-        data_dir=cfg.data_dir
-    )
-    # See more about loading custom images at
-    # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-    image_column = column_names[0]
-    caption_column = column_names[1]
-
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption)
-                                if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(
-                cfg.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.RandomCrop(cfg.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [
-            train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
-        return examples
-
     with accelerator.main_process_first():
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-
-    def collate_fn(examples): # 打包成batch
-        pixel_values = torch.stack([example["pixel_values"]
-                                   for example in examples])
-        pixel_values = pixel_values.to(
-            memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        # Set the training transforms 确保数据集的预处理和转换只执行一次，并且由主进程负责。
+        # train_dataset = dataset["train"].with_transform(preprocess_train)
+        train_dataset = TrainData(cfg)
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
         batch_size=cfg.train_batch_size,
         num_workers=cfg.dataloader_num_workers,
     )
@@ -279,8 +240,9 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    # if accelerator.is_main_process:
-    #     accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+    if accelerator.is_main_process:
+        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+        tensorboard_tracker = accelerator.get_tracker("tensorboard")
 
     # Train!
     total_batch_size = cfg.train_batch_size * \
@@ -332,14 +294,17 @@ def main():
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
+    # from torch.utils.tensorboard import SummaryWriter
+    # tb_writer = SummaryWriter(log_dir='./logs')
 
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
+                # print(batch[0].shape) # torch.Size([1, 3, 512, 512])
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(
+                latents = vae.encode(batch[0].to(
                     dtype=weight_dtype)).latent_dist.sample()
                 
                 latents = latents * vae.config.scaling_factor  # vae.config.scaling_factor =0.18215
@@ -364,8 +329,7 @@ def main():
                     latents, noise, timesteps)
 
                 # Get the text embedding for conditioning  ## 文本条件注入
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
+                encoder_hidden_states = text_encoder(batch[1])[0].to(torch.float32)
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -401,11 +365,12 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                tensorboard_tracker.log({"loss": loss.item()}, step=global_step)
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-
-                if global_step % cfg.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
+                if accelerator.is_main_process:
+                    # tb_writer.add_scalar('loss', loss.item(), global_step)
+                    if global_step % cfg.checkpointing_steps == 0:
                         save_path = os.path.join(
                             cfg.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
@@ -428,6 +393,7 @@ def main():
             progress_bar.set_postfix(**logs)
 
             if global_step >= max_train_steps:
+                # tb_writer.close()
                 break
 
     # Save the lora layers

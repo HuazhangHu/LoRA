@@ -2,3 +2,9 @@ runwayml/*
 dataset/*
 ckpt/*
 lllyasviel/*
+output/*
+log/*
+logs/*
+h94/*
+ckpt_batch2/*
+ckpt_new/*

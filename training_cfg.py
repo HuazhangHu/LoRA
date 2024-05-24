@@ -40,6 +40,6 @@ def load_training_config(config_path: str) -> TrainingConfig:
     return TrainingConfig(**data_dict)
 
 
-if __name__ == '__main__':
-    config = load_training_config('config/train/mountain.json')
-    print(config)
+# if __name__ == '__main__':
+#     config = load_training_config('config/train/mountain.json')
+#     print(config)
