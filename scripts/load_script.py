@@ -1,10 +1,10 @@
 
-
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
 import os
 import json
 
 # 指定图片所在的文件夹路径
-image_folder = 'dataset/Antique_style/images'
+image_folder = 'dataset/cartoon'
 # 指定额外的文本信息
 text_info = "Antique style"
 # 指定metadata.jsonl文件的路径

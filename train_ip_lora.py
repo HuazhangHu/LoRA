@@ -39,7 +39,7 @@ from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel
@@ -113,8 +113,9 @@ def get_models(cfg):
     unet = UNet2DConditionModel.from_pretrained(
         cfg.pretrained_model_name_or_path, subfolder="unet"
     )
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(cfg.image_encoder_path)
 
-    return noise_scheduler, tokenizer, text_encoder, vae, unet
+    return noise_scheduler, tokenizer, text_encoder, vae, unet, image_encoder
 
 def lora_adapter(cfg):
     lora_config = LoraConfig(
@@ -144,12 +145,12 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler, tokenizer, text_encoder, vae, unet = get_models(cfg)
+    noise_scheduler, tokenizer, text_encoder, vae, unet, image_encoder = get_models(cfg)
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)  # Freeze
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-
+    image_encoder.requires_grad_(False)
     # Freeze the unet parameters before adding adapters for training
     for param in unet.parameters():
         param.requires_grad_(False)

@@ -22,6 +22,7 @@ import random
 import shutil
 from pathlib import Path
 from PIL import Image
+# from tensorboardX import SummaryWriter
 
 import datasets
 import numpy as np
@@ -241,8 +242,9 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
-        tensorboard_tracker = accelerator.get_tracker("tensorboard")
+        accelerator.init_trackers(cfg.log_dir, config=vars(args))
+        # tensorboard_tracker = accelerator.get_tracker("tensorboard")
+        # writer = SummaryWriter(log_dir=os.path.join('tensor_log/', cfg.log_dir))
 
     # Train!
     total_batch_size = cfg.train_batch_size * \
@@ -365,7 +367,8 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                tensorboard_tracker.log({"loss": loss.item()}, step=global_step)
+                # tensorboard_tracker.log({"loss": loss.item()}, step=global_step)
+                # writer.add_scalars('train/loss',{"train_loss": train_loss}, global_step)
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
                 if accelerator.is_main_process:
@@ -392,8 +395,10 @@ def main():
             ), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
+            # writer.add_scalars('learning_rate', {"learning_rate": optimizer.state_dict()['param_groups'][0]['lr']}, epoch)
+
             if global_step >= max_train_steps:
-                # tb_writer.close()
+                writer.close()
                 break
 
     # Save the lora layers
